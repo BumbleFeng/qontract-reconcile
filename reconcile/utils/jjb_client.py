@@ -22,13 +22,17 @@ from sretoolbox.utils import retry
 
 from reconcile.exceptions import FetchResourceError
 
+JJB_INI = "[jenkins]\nurl = https://JENKINS_URL"
+
 
 class JJB(object):
     """Wrapper around Jenkins Jobs"""
 
-    def __init__(self, configs, ssl_verify=True, settings=None):
-        self.settings = settings
-        self.secret_reader = SecretReader(settings=settings)
+    def __init__(self, configs, ssl_verify=True,
+                 settings=None, local=False):
+        self.local = local
+        if not local:
+            self.secret_reader = SecretReader(settings=settings)
         self.collect_configs(configs)
         self.modify_logger()
         self.python_https_verify = str(int(ssl_verify))
@@ -48,9 +52,11 @@ class JJB(object):
             token = data['token']
             server_url = data['serverUrl']
             wd = tempfile.mkdtemp()
-            ini = self.secret_reader.read(token)
-            ini = ini.replace('"', '')
-            ini = ini.replace('false', 'False')
+            ini = JJB_INI
+            if not self.local:
+                ini = self.secret_reader.read(token)
+                ini = ini.replace('"', '')
+                ini = ini.replace('false', 'False')
             ini_file_path = '{}/{}.ini'.format(wd, name)
             with open(ini_file_path, 'w') as f:
                 f.write(ini)

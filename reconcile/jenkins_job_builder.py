@@ -31,6 +31,7 @@ QUERY = """
 """
 
 QONTRACT_INTEGRATION = 'jenkins-job-builder'
+GENERATE_TYPE = ['jobs', 'views']
 
 
 def get_openshift_saas_deploy_job_name(saas_file_name, env_name, settings):
@@ -38,7 +39,7 @@ def get_openshift_saas_deploy_job_name(saas_file_name, env_name, settings):
     return f"{job_template_name}-{saas_file_name}-{env_name}"
 
 
-def collect_saas_file_configs():
+def collect_saas_file_configs(settings):
     # collect a list of jobs per saas file per environment.
     # each saas_file_config should have the structure described
     # in the above query.
@@ -47,7 +48,6 @@ def collect_saas_file_configs():
     saas_file_configs = []
     repo_urls = set()
     saas_files = queries.get_saas_files()
-    settings = queries.get_app_interface_settings()
     job_template_name = settings['saasDeployJobTemplate']
     for saas_file in saas_files:
         saas_file_name = saas_file['name']
@@ -140,22 +140,27 @@ def collect_saas_file_configs():
         jc_data = saas_file_config.pop('data')
         saas_file_config['config'] = json.dumps([jc_data])
 
-    return saas_file_configs, settings, repo_urls
+    return saas_file_configs, repo_urls
 
 
-def collect_configs():
+def collect_configs(jenkins_config):
+    settings = queries.get_app_interface_settings()
     gqlapi = gql.get_api()
     raw_jjb_configs = gqlapi.query(QUERY)['jenkins_configs']
-    saas_file_configs, settings, saas_file_repo_urls = \
-        collect_saas_file_configs()
+    if jenkins_config:
+        configs = [n for n in raw_jjb_configs
+                   if n['type'] not in GENERATE_TYPE
+                   or n['name'] == jenkins_config]
+        return configs, settings, {}
+    saas_file_configs, saas_file_repo_urls = \
+        collect_saas_file_configs(settings)
     configs = raw_jjb_configs + saas_file_configs
-
     return configs, settings, saas_file_repo_urls
 
 
-def init_jjb():
-    configs, settings, additional_repo_urls = collect_configs()
-    return JJB(configs, ssl_verify=False, settings=settings), \
+def init_jjb(jenkins_config=None, local=False):
+    configs, settings, additional_repo_urls = collect_configs(jenkins_config)
+    return JJB(configs, ssl_verify=False, settings=settings, local=local), \
         additional_repo_urls
 
 
@@ -182,20 +187,24 @@ def validate_repos_and_admins(jjb, additional_repo_urls):
 
 
 @defer
-def run(dry_run, io_dir='throughput/', defer=None):
-    jjb, additional_repo_urls = init_jjb()
+def run(dry_run, jenkins_config=None, io_dir='throughput/', defer=None):
+    local = bool(jenkins_config)
+    jjb, additional_repo_urls = init_jjb(jenkins_config, local)
     defer(lambda: jjb.cleanup())
 
-    accounts = queries.get_aws_accounts()
-    state = State(
-        integration=QONTRACT_INTEGRATION,
-        accounts=accounts,
-        settings=jjb.settings
-    )
+    if not local:
+        accounts = queries.get_aws_accounts()
+        state = State(
+            integration=QONTRACT_INTEGRATION,
+            accounts=accounts,
+            settings=jjb.settings
+        )
 
-    if dry_run:
+    if dry_run or local:
         validate_repos_and_admins(jjb, additional_repo_urls)
         jjb.generate(io_dir, 'desired')
+        if local:
+            sys.exit(0)
         jjb.overwrite_configs(state)
         jjb.generate(io_dir, 'current')
         jjb.print_diffs(io_dir)
