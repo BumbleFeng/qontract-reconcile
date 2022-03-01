@@ -12,12 +12,13 @@ import tempfile
 from threading import Lock
 
 from typing import (
-    Any, Dict, List, Iterable, Mapping, MutableMapping, Optional
+    Any, Dict, List, Iterable, Mapping, MutableMapping, Optional, Tuple
 )
 from ipaddress import ip_network, ip_address
 
 import anymarkup
 import requests
+from github import Github
 
 from terrascript import (Terrascript, provider, Provider, Terraform,
                          Backend, Output, data)
@@ -80,6 +81,7 @@ from terrascript.resource import (
 # temporary to create aws_ecrpublic_repository
 from terrascript import Resource
 from sretoolbox.utils import threaded
+from reconcile import queries
 
 from reconcile.utils import gql
 from reconcile.utils.aws_api import AWSApi
@@ -155,12 +157,19 @@ class ElasticSearchLogGroupInfo:
 
 class TerrascriptClient:
     def __init__(self, integration, integration_prefix,
-                 thread_pool_size, accounts, settings=None):
+                 thread_pool_size, accounts, settings=None, init_aws=False):
         self.integration = integration
         self.integration_prefix = integration_prefix
         self.settings = settings
         self.thread_pool_size = thread_pool_size
         filtered_accounts = self.filter_disabled_accounts(accounts)
+        if init_aws:
+            self.ci_account = queries.get_ci_aws_accounts()[0]
+            if self.ci_account not in filtered_accounts:
+                accounts.append(self.ci_account)
+            self.aws = AWSApi(1, accounts,
+                              settings=self.settings,
+                              init_users=False)
         self.secret_reader = SecretReader(settings=settings)
         self.populate_configs(filtered_accounts)
         self.versions = {a['name']: a['providerVersion']
@@ -223,6 +232,8 @@ class TerrascriptClient:
                            for a in filtered_accounts}
         self.logtoes_zip = ''
         self.logtoes_zip_lock = Lock()
+        self.github = None
+        self.github_lock = Lock()
 
     def get_logtoes_zip(self, release_url):
         if not self.logtoes_zip:
@@ -250,6 +261,14 @@ class TerrascriptClient:
             # pylint: disable=consider-using-with
             open(zip_file, 'wb').write(r.content)
         return zip_file
+
+    def init_github(self) -> Github:
+        if not self.github:
+            with self.github_lock:
+                if not self.github:
+                    token = get_default_config()['token']
+                    self.github = Github(token, base_url=GH_BASE_URL)
+        return self.github
 
     def filter_disabled_accounts(self, accounts):
         filtered_accounts = []
@@ -959,7 +978,8 @@ class TerrascriptClient:
         elif provider == 'secrets-manager':
             self.populate_tf_resource_secrets_manager(resource, namespace_info)
         elif provider == 'asg':
-            self.populate_tf_resource_asg(resource, namespace_info)
+            self.populate_tf_resource_asg(resource, namespace_info,
+                                          existing_secrets)
         elif provider == 'route53-zone':
             self.populate_tf_resource_route53_zone(resource, namespace_info)
         else:
@@ -4073,17 +4093,91 @@ class TerrascriptClient:
 
         self.add_resources(account, tf_resources)
 
-    def populate_tf_resource_asg(self, resource, namespace_info):
+    def _get_commit_sha(self, repo_info: dict) -> str:
+        url = repo_info['url']
+        ref = repo_info['ref']
+        pattern = r'^[0-9a-f]{40}$'
+        # get commit_sha from ref
+        if re.match(pattern, ref):
+            return ref
+        # get commit_sha from branch
+        elif 'github' in url:
+            github = self.init_github()
+            repo_name = url.rstrip("/").replace('https://github.com/', '')
+            repo = github.get_repo(repo_name)
+            commit = repo.get_commit(sha=ref)
+            return commit.sha
+        elif 'gitlab' in url:
+            raise ValueError("dose not support gitlab repo for now")
+
+        return ''
+
+    def _get_asg_image_id(self, image: dict,
+                          existing_secrets: dict, output_prefix: str,
+                          account: str, region: str) -> Tuple[str, str]:
+        """
+        AMI ID comes form queries result or AWS Api filter result.
+        AMI needs to be built by ci account and shared with target account.
+        AMI needs to be taged with a tag_name and
+        its value need to be the commit sha comes from upstream repo.
+        In case of there is a new commit while the packer job is still running,
+        use the AMI form existing asg.
+        """
+        image_id = image.get('id')
+        if image_id:
+            return image_id, ''
+
+        image_repo = image['repo']
+        commit_sha = self._get_commit_sha()
+        tag_name = image_repo['tag_name']
+
+        # Get the most recent AMI id
+        ci_account_name = self.ci_account['name']
+        owner = [self.ci_account['uid']]
+        filters = [{
+            'Name': 'tag:' + tag_name,
+            'Values': [commit_sha]
+        }]
+        image_id = self.aws.get_image_id(ci_account_name, region, owner,
+                                         filters)
+        if not image_id:
+            logging.warning(f"could not find ami with filters {filters}"
+                            f"in account {ci_account_name}, "
+                            f"use existing asg's ami info")
+            try:
+                existing_image = \
+                    existing_secrets[account][output_prefix]
+            except KeyError:
+                raise ValueError(f"could not find existing asg's ami info"
+                                 f"for {output_prefix} in account {account}")
+            return existing_image['image_id'], existing_image['commit_sha']
+
+        # Check if the ami has been shared with target account
+        filters = [{
+            'Name': 'image-id',
+            'Values': image_id
+        }]
+        share_id = self.aws.get_image_id(account, region, owner, filters)
+        if not share_id:
+            raise ValueError(f'ami {image_id} has not been shared'
+                             f'with account {account}')
+        return image_id[0], commit_sha
+
+    def populate_tf_resource_asg(self, resource: dict,
+                                 namespace_info: dict,
+                                 existing_secrets: dict) -> None:
         account, identifier, common_values, \
             output_prefix, output_resource_name, annotations = \
             self.init_values(resource, namespace_info)
 
-        tf_resources = []
+        tf_resources: List[Any] = []
         self.init_common_outputs(tf_resources, namespace_info, output_prefix,
                                  output_resource_name, annotations)
 
         tags = common_values['tags']
         tags['Name'] = identifier
+        region = common_values.get('region') or \
+            self.default_regions.get(account)
 
         template_values = {
             "name": identifier,
@@ -4106,11 +4200,11 @@ class TerrascriptClient:
         }
 
         image = common_values.get('image')
-        image_id = image.get('id')
+        image_id, commit_sha = \
+            self._get_asg_image_id(image, existing_secrets, output_prefix,
+                                   account, region)
         template_values['image_id'] = image_id
 
-        region = common_values.get('region') or \
-            self.default_regions.get(account)
         if self._multiregion_account(account):
             template_values['provider'] = 'aws.' + region
 
@@ -4205,6 +4299,9 @@ class TerrascriptClient:
         tf_resources.append(Output(output_name_0_13, value=output_value))
         output_name_0_13 = output_prefix + '__image_id'
         output_value = image_id
+        tf_resources.append(Output(output_name_0_13, value=output_value))
+        output_name_0_13 = output_prefix + '__commit_sha'
+        output_value = commit_sha
         tf_resources.append(Output(output_name_0_13, value=output_value))
 
         self.add_resources(account, tf_resources)
