@@ -1,6 +1,7 @@
 import logging
 from collections.abc import (
     Iterable,
+    Mapping,
     Set,
 )
 from contextlib import suppress
@@ -49,6 +50,7 @@ from reconcile.utils.mr.labels import (
     prioritized_approval_label,
 )
 from reconcile.utils.sharding import is_in_shard
+from reconcile.utils.state import State, init_state
 
 MERGE_LABELS_PRIORITY = [
     prioritized_approval_label(p.value) for p in ChangeTypePriority
@@ -70,7 +72,6 @@ HOLD_LABELS = [
 QONTRACT_INTEGRATION = "gitlab-housekeeping"
 DATE_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 EXPIRATION_DATE_FORMAT = "%Y-%m-%d"
-
 
 merged_merge_requests = Counter(
     name="qontract_reconcile_merged_merge_requests",
@@ -177,6 +178,73 @@ def clean_pipelines(
                     f"unable to cancel {p['web_url']} - "
                     f"error message {err.error_message}"
                 )
+
+
+def verify_ondemend_tests(
+    dry_run: bool,
+    mr: ProjectMergeRequest,
+    must_pass: Iterable[str],
+    gl: GitLabApi,
+    gl_instance: Mapping[str, Any],
+    gl_settings: Mapping[str, Any],
+    state: State,
+) -> bool:
+    pipelines = gl.get_merge_request_pipelines(mr)
+    running_pipelines = [p for p in pipelines if p["status"] == "running"]
+    if running_pipelines:
+        # wait for pipeline complate
+        return False
+
+    gl_fork = GitLabApi(
+        instance=gl_instance,
+        project_id=mr.source_project_id,
+        settings=gl_settings,
+    )
+    commit = next(mr.commits())
+    statuses = gl_fork.project.commits.get(commit.id).statuses.list()
+    test_state = {}
+    for s in statuses:
+        test_state[s.name] = s.status
+    state_key = f"{gl.project.path_with_namespace}/{mr.iid}/{commit.id}"
+    if state.get(state_key, None) == test_state:
+        # tests are still incomplate
+        return False
+
+    remain_tests = [t for t in must_pass if test_state.get(t) != "success"]
+
+    if remain_tests:
+        logging.info([
+            "ondemend tests",
+            "add comment",
+            gl.project.name,
+            mr.iid,
+            commit.id,
+        ])
+        if not dry_run:
+            markdown_report = (
+                f"Ondemend Tests: \n\n For latest [commit]({commit.web_url}) You will need to pass following test jobs to get this MR merged.\n\n"
+                f"Add comment with `/test [test_name]` to trigger the tests.\n\n"
+            )
+            markdown_report += f"* {', '.join(remain_tests)}\n"
+            gl.delete_merge_request_comments(mr, startswith="Ondemend Tests:")
+            gl.add_comment_to_merge_request(mr, markdown_report)
+            # only add state when tests are incomplate
+            state.add(state_key, test_state, force=True)
+        return False
+    else:
+        # no remain_tests, pass the check
+        logging.info([
+            "ondemend tests",
+            "check pass",
+            gl.project.name,
+            mr.iid,
+            commit.id,
+        ])
+        if not dry_run:
+            markdown_report = f"Ondemend Tests: \n\n All necessary tests have paased for latest [commit]({commit.web_url})\n"
+            gl.delete_merge_request_comments(mr, startswith="Ondemend Tests:")
+            gl.add_comment_to_merge_request(mr, markdown_report)
+        return True
 
 
 def close_item(
@@ -291,6 +359,7 @@ def is_rebased(mr, gl: GitLabApi) -> bool:
 def get_merge_requests(
     dry_run: bool,
     gl: GitLabApi,
+    state: State,
     users_allowed_to_label: Iterable[str] | None = None,
 ) -> list[dict[str, Any]]:
     mrs = gl.get_merge_requests(state=MRState.OPENED)
@@ -298,6 +367,7 @@ def get_merge_requests(
         dry_run=dry_run,
         gl=gl,
         project_merge_requests=mrs,
+        state=state,
         users_allowed_to_label=users_allowed_to_label,
     )
 
@@ -306,7 +376,11 @@ def preprocess_merge_requests(
     dry_run: bool,
     gl: GitLabApi,
     project_merge_requests: list[ProjectMergeRequest],
+    state: State,
     users_allowed_to_label: Iterable[str] | None = None,
+    must_pass: Iterable[str] = [],
+    gl_instance: Mapping[str, Any] = {},
+    gl_settings: Mapping[str, Any] = {},
 ) -> list[dict[str, Any]]:
     results = []
     for mr in project_merge_requests:
@@ -318,6 +392,11 @@ def preprocess_merge_requests(
         if mr.draft:
             continue
         if len(mr.commits()) == 0:
+            continue
+
+        if must_pass and not verify_ondemend_tests(
+            dry_run, mr, must_pass, gl, gl_instance, gl_settings, state
+        ):
             continue
 
         labels = set(mr.labels)
@@ -405,10 +484,12 @@ def rebase_merge_requests(
     gl_instance=None,
     gl_settings=None,
     users_allowed_to_label=None,
+    state=None,
 ):
     rebases = 0
     merge_requests = [
-        item["mr"] for item in get_merge_requests(dry_run, gl, users_allowed_to_label)
+        item["mr"]
+        for item in get_merge_requests(dry_run, gl, state, users_allowed_to_label)
     ]
     for mr in merge_requests:
         if is_rebased(mr, gl):
@@ -477,12 +558,21 @@ def merge_merge_requests(
     gl_instance=None,
     gl_settings=None,
     users_allowed_to_label=None,
+    must_pass=None,
+    state=None,
 ):
     merges = 0
     if reload_toggle.reload:
         project_merge_requests = gl.get_merge_requests(state=MRState.OPENED)
     merge_requests = preprocess_merge_requests(
-        dry_run, gl, project_merge_requests, users_allowed_to_label
+        dry_run,
+        gl,
+        project_merge_requests,
+        state,
+        users_allowed_to_label,
+        must_pass,
+        gl_instance,
+        gl_settings,
     )
     merge_requests_waiting.labels(gl.project.id).set(len(merge_requests))
 
@@ -582,6 +672,7 @@ def run(dry_run, wait_for_pipeline):
     repos = queries.get_repos_gitlab_housekeeping(server=instance["url"])
     repos = [r for r in repos if is_in_shard(r["url"])]
     app_sre_usernames: Set[str] = set()
+    state = init_state(QONTRACT_INTEGRATION)
 
     for repo in repos:
         hk = repo["housekeeping"]
@@ -624,6 +715,7 @@ def run(dry_run, wait_for_pipeline):
             ]
             reload_toggle = ReloadToggle(reload=False)
             rebase = hk.get("rebase")
+            must_pass = hk.get("must_pass")
             try:
                 merge_merge_requests(
                     dry_run,
@@ -639,6 +731,8 @@ def run(dry_run, wait_for_pipeline):
                     gl_instance=instance,
                     gl_settings=settings,
                     users_allowed_to_label=users_allowed_to_label,
+                    must_pass=must_pass,
+                    state=state,
                 )
             except Exception:
                 logging.error(
@@ -657,6 +751,8 @@ def run(dry_run, wait_for_pipeline):
                     gl_instance=instance,
                     gl_settings=settings,
                     users_allowed_to_label=users_allowed_to_label,
+                    must_pass=must_pass,
+                    state=state,
                 )
             if rebase:
                 rebase_merge_requests(
@@ -668,4 +764,5 @@ def run(dry_run, wait_for_pipeline):
                     gl_instance=instance,
                     gl_settings=settings,
                     users_allowed_to_label=users_allowed_to_label,
+                    state=state,
                 )
